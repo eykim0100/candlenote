@@ -138,10 +138,15 @@ def price_call(**params):
         raise RuntimeError(f"공공데이터포털 응답 오류: {reason} "
                            "(인증키가 아직 활성화 전이거나 DATA_GO_KR_KEY에 Decoding 키가 아닌 값이 들어갔을 수 있어요)")
     j = r.json()
-    header = j.get("response", {}).get("header", {})
-    if header.get("resultCode") not in (None, "00"):
-        raise RuntimeError(f"공공데이터포털 오류 {header.get('resultCode')}: {header.get('resultMsg')}")
-    body = j["response"]["body"]
+    resp = j.get("response", j)          # 보통은 {"response": {...}}, 형식이 다르면 그대로
+    header = resp.get("header", {}) if isinstance(resp, dict) else {}
+    code = header.get("resultCode") or j.get("resultCode")
+    if code not in (None, "00", "0"):
+        msg = header.get("resultMsg") or j.get("resultMsg")
+        raise RuntimeError(f"공공데이터포털 오류 {code}: {msg}")
+    body = resp.get("body") if isinstance(resp, dict) else None
+    if not isinstance(body, dict):
+        raise RuntimeError(f"공공데이터포털 응답 형식이 예상과 달라요 (HTTP {r.status_code}): {text[:300]}")
     items = body.get("items") or {}
     items = items.get("item", []) if isinstance(items, dict) else []
     if isinstance(items, dict):
@@ -658,4 +663,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RuntimeError as e:
+        log("❌ " + str(e))
+        sys.exit(1)
