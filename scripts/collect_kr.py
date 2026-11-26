@@ -27,6 +27,7 @@ import requests
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data" / "kr"
 NOTES_FILE = ROOT / "data" / "kr_notes.json"
+PINS_FILE = ROOT / "data" / "kr_pins.json"
 KST = dt.timezone(dt.timedelta(hours=9))
 
 TOP_N = int(os.environ.get("TOP_N", "100"))   # 시가총액 상위 몇 종목까지 모을지
@@ -36,7 +37,9 @@ KEEP_DROPPED_DAYS = 30     # 상위권에서 빠진 종목도 30일간은 계속
 FIN_REFRESH_DAYS = 7       # 재무·배당은 7일마다 다시 확인
 INFO_REFRESH_DAYS = 30     # 기업 기본정보는 30일마다
 NEWS_LOOKBACK_DAYS = 4     # 뉴스는 최근 며칠 안의 이벤트만 찾음 (검색 API가 날짜 필터를 지원하지 않음)
-NEWS_MAX_CALLS = 400       # 하루 뉴스 API 호출 상한 (무료 한도 하루 25,000회보다 훨씬 적게)
+NEWS_MAX_CALLS = 400       # 최근 이벤트용 하루 뉴스 API 호출 상한
+BACKFILL_MAX_CALLS = 5000  # 과거 이벤트 기사 채우기용 하루 상한 (둘을 합쳐도 무료 한도 하루 25,000회의 약 20%)
+BACKFILL_PAGES = 10        # 검색어 하나당 최대 100건 × 10쪽
 
 KEY_PRICE = os.environ.get("DATA_GO_KR_KEY", "").strip()
 KEY_DART = os.environ.get("DART_API_KEY", "").strip()
@@ -117,6 +120,13 @@ def save_json(path, obj):
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(obj, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     tmp.replace(path)
+
+
+def next_weekday(d):
+    d += dt.timedelta(days=1)
+    while d.weekday() >= 5:
+        d += dt.timedelta(days=1)
+    return d
 
 
 def days_since(iso_date):
@@ -440,6 +450,7 @@ PRESS = {
 NEWS_WORDS = ("급등", "급락", "상승", "하락", "강세", "약세", "신고가", "신저가", "상한가", "하한가", "폭등", "폭락",
               "공시", "실적", "계약", "주가", "특징주", "매수", "매도", "거래량")
 NEWS_CALLS = 0
+BACKFILL_CALLS = 0
 
 
 def press_of(url):
@@ -454,16 +465,73 @@ def clean(s):
     return html.unescape(re.sub(r"<[^>]+>", "", s or "")).strip()
 
 
-def news_page(query, start):
-    global NEWS_CALLS
-    if NEWS_CALLS >= NEWS_MAX_CALLS:
-        return None
-    NEWS_CALLS += 1
-    r = http_get(NEWS_URL, params={"query": query, "display": 100, "start": start, "sort": "date"},
+def news_page(query, start, sort="date"):
+    global NEWS_CALLS, BACKFILL_CALLS
+    if sort == "date":
+        if NEWS_CALLS >= NEWS_MAX_CALLS:
+            return None
+        NEWS_CALLS += 1
+    else:
+        if BACKFILL_CALLS >= BACKFILL_MAX_CALLS:
+            return None
+        BACKFILL_CALLS += 1
+    r = http_get(NEWS_URL, params={"query": query, "display": 100, "start": start, "sort": sort},
                  headers={"X-NCP-APIGW-API-KEY-ID": NAVER_ID, "X-NCP-APIGW-API-KEY": NAVER_SECRET})
     if r.status_code != 200:
         raise RuntimeError(f"뉴스 API HTTP {r.status_code}: {r.text[:200]}")
     return r.json().get("items", [])
+
+
+def score_item(it, name):
+    """(발행시각, 점수, 기사정보) 또는 None. 제목에 종목명이 있어야 함."""
+    try:
+        t = parsedate_to_datetime(it.get("pubDate")).astimezone(KST)
+    except (TypeError, ValueError):
+        return None
+    title = clean(it.get("title"))
+    if name not in title:
+        return None
+    url = it.get("originallink") or it.get("link")
+    press, major = press_of(url)
+    score = (2 if major else 0) + (1 if any(w in title for w in NEWS_WORDS) else 0)
+    return t, score, {"t": title, "u": url, "p": press, "tm": t.strftime("%Y-%m-%d %H:%M")}
+
+
+def pick_for_event(cands, date_iso, prev_iso):
+    start_t = dt.datetime.fromisoformat(prev_iso + "T15:30:00+09:00")
+    end_t = dt.datetime.fromisoformat(date_iso + "T23:59:59+09:00")
+    inside = [c for c in cands if start_t < c[0] <= end_t]
+    if not inside:
+        return None
+    inside.sort(key=lambda c: (-c[1], c[0]))      # 점수 높은 것, 같으면 이른 기사
+    return inside[0][2]
+
+
+def backfill_news(stock, pending):
+    """과거 이벤트: 날짜 필터가 없어서 관련도순 검색 결과를 모아 날짜로 걸러요.
+    종목당 검색어 4개 × 최대 10쪽을 한 번 모아서 그 종목의 모든 과거 이벤트에 같이 써요."""
+    name, cands, seen = stock["name"], [], set()
+    for q in (f"{name} 특징주", f"{name} 급등", f"{name} 급락", f"{name} 주가"):
+        for page in range(BACKFILL_PAGES):
+            items = news_page(q, 1 + page * 100, sort="sim")
+            if items is None:
+                return False                             # 오늘 상한 도달 → 내일 이어서
+            for it in items:
+                c = score_item(it, name)
+                if c and c[2]["u"] not in seen:
+                    seen.add(c[2]["u"])
+                    cands.append(c)
+            if len(items) < 100:
+                break
+    dates = [b[0] for b in stock["bars"]]
+    for d in pending:
+        i = dates.index(d)
+        e = stock["events"].setdefault(d, {})
+        found = pick_for_event(cands, d, dates[i - 1] if i else d)
+        if found:
+            e["n"] = found
+        e["nb"] = 1                                     # 과거 기사 찾기 시도 완료
+    return True
 
 
 def find_news(name, date_iso, prev_iso):
@@ -499,6 +567,42 @@ def find_news(name, date_iso, prev_iso):
     return best[1] if best else None
 
 
+# ---------------------------------------------------------------- 직접 고정한 기사: 제목 채우기
+def fill_pin_titles(limit=50):
+    pins = load_json(PINS_FILE, {})
+    done = 0
+    for code, days in pins.items():
+        for d, p in days.items():
+            if done >= limit:
+                break
+            if not isinstance(p, dict) or not p.get("u"):
+                continue
+            if not p.get("p"):
+                p["p"] = press_of(p["u"])[0]
+                done += 1
+            if p.get("t") or p.get("tf", 0) >= 3:
+                continue
+            done += 1
+            try:
+                r = SESSION.get(p["u"], timeout=15, headers={"User-Agent": "Mozilla/5.0 (compatible; candlenote/1.0)"})
+                if not r.encoding or r.encoding.lower() == "iso-8859-1":
+                    r.encoding = r.apparent_encoding
+                text = r.text[:300000]
+                m = (re.search(r'<meta[^>]+property=["\']og:title["\'][^>]*content=["\']([^"\']+)', text, re.I)
+                     or re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]*property=["\']og:title', text, re.I)
+                     or re.search(r"<title[^>]*>(.*?)</title>", text, re.I | re.S))
+                title = clean(m.group(1))[:200] if m else ""
+                if title:
+                    p["t"] = title
+                else:
+                    p["tf"] = p.get("tf", 0) + 1
+            except Exception:
+                p["tf"] = p.get("tf", 0) + 1
+    if done:
+        save_json(PINS_FILE, pins)
+        log(f"📌 고정한 기사 {done}건 정리")
+
+
 # ---------------------------------------------------------------- main
 def main():
     missing = [k for k, v in (("DATA_GO_KR_KEY", KEY_PRICE), ("DART_API_KEY", KEY_DART),
@@ -508,6 +612,11 @@ def main():
         sys.exit(1)
     if missing:
         warn("다음 키가 없어서 해당 부분은 건너뛰어요: " + ", ".join(missing))
+
+    try:
+        fill_pin_titles()
+    except Exception as e:
+        warn(f"고정 기사 제목: {e}")
 
     meta = load_json(DATA / "_meta.json", {})
     notes = load_json(NOTES_FILE, {})
@@ -544,7 +653,7 @@ def main():
                 log(f"   [{n}/{len(tracked)}] {row['itmsNm']} 과거 시세 수집")
                 for b in fetch_history(code, latest - dt.timedelta(days=BACKFILL_DAYS), latest):
                     bars[b[0]] = b
-            elif last_date and (latest - dt.date.fromisoformat(last_date)).days > 4:
+            elif last_date and next_weekday(dt.date.fromisoformat(last_date)) < latest:   # 빠진 날 채우기
                 for b in fetch_history(code, dt.date.fromisoformat(last_date) + dt.timedelta(days=1), latest):
                     bars[b[0]] = b
         except Exception as e:
@@ -638,6 +747,27 @@ def main():
                 except Exception as err:
                     warn(f"{s['name']} 뉴스: {err}")
         log(f"   뉴스 API 호출 {NEWS_CALLS}회")
+
+        # 4-2) 과거 이벤트 기사 채우기: 하루 상한만큼씩 매일 이어서
+        todo = []
+        for s in stocks.values():
+            pend = [d for d in sorted(detect_events(s["bars"]))
+                    if not s["events"].get(d, {}).get("n") and not s["events"].get(d, {}).get("nb")
+                    and (d < meta["news_since"] or s["events"].get(d, {}).get("nc") or days_since(d) > NEWS_LOOKBACK_DAYS)]
+            if pend:
+                todo.append((s, pend))
+        if todo:
+            log(f"🗂️  과거 이벤트 기사 채우기: {len(todo)}종목 남음")
+            done = 0
+            for s, pend in todo:
+                try:
+                    if not backfill_news(s, pend):
+                        break
+                    done += 1
+                except Exception as err:
+                    warn(f"{s['name']} 과거 기사: {err}")
+            log(f"   {done}종목 완료, 호출 {BACKFILL_CALLS}회" + (" (나머지는 내일 이어서)" if done < len(todo) else ""))
+        meta["backfill_left"] = len(todo) - (done if todo else 0)
 
     # 5) 저장
     index = []
