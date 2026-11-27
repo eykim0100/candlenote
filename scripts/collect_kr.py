@@ -55,9 +55,21 @@ NEWS_URL = "https://naverapihub.apigw.ntruss.com/search/v1/news"
 TODAY = dt.datetime.now(KST).date()
 WARNINGS = []
 
+# 워크플로 제한(60분)에 걸리면 모은 게 다 사라지므로, 이 시간이 지나면 남은 일은 다음 실행으로 미루고 저장
+TIME_BUDGET = int(os.environ.get("TIME_BUDGET_MIN", "45")) * 60
+START = time.monotonic()
+
+
+def elapsed():
+    return int(time.monotonic() - START)
+
+
+def time_up():
+    return elapsed() >= TIME_BUDGET
+
 
 def log(msg):
-    print(msg, flush=True)
+    print(f"[{elapsed() // 60:02d}:{elapsed() % 60:02d}] {msg}", flush=True)
 
 
 def warn(msg):
@@ -648,6 +660,7 @@ def main():
 
     # 2) 종목별 일봉 갱신
     stocks = {}
+    skipped_hist = 0
     for n, code in enumerate(tracked, 1):
         row = rows[code]
         path = DATA / f"{code}.json"
@@ -655,7 +668,9 @@ def main():
         bars = {b[0]: b for b in s.get("bars", [])}
         last_date = max(bars) if bars else None
         try:
-            if len(bars) < 200:
+            if time_up():
+                skipped_hist += 1
+            elif len(bars) < 200:
                 log(f"   [{n}/{len(tracked)}] {row['itmsNm']} 과거 시세 수집")
                 for b in fetch_history(code, latest - dt.timedelta(days=BACKFILL_DAYS), latest):
                     bars[b[0]] = b
@@ -675,9 +690,14 @@ def main():
             s["last_top"] = TODAY.isoformat()
         s.setdefault("events", {})
         stocks[code] = s
+    if skipped_hist:
+        warn(f"시간이 부족해서 {skipped_hist}종목의 과거 시세는 다음 실행 때 이어서 받아요.")
+    log("   일봉 갱신 끝")
 
     # 3) DART: 재무·배당·기업정보·공시
-    if KEY_DART:
+    if KEY_DART and time_up():
+        warn("시간이 부족해서 DART 재무·공시는 다음 실행 때 받아요.")
+    elif KEY_DART:
         try:
             corp_map = dart_corp_codes()
         except Exception as e:
@@ -704,6 +724,8 @@ def main():
                         warn(f"{s['name']} 배당: {e}")
         for s in stocks.values():
             c = s.get("corp")
+            if time_up():
+                break
             if c and days_since(s.get("info_at")) >= INFO_REFRESH_DAYS:
                 try:
                     info = collect_company(c)
@@ -716,6 +738,9 @@ def main():
         log("📑 이벤트 날 공시 확인")
         for s in stocks.values():
             c = s.get("corp")
+            if time_up():
+                warn("시간이 부족해서 나머지 공시는 다음 실행 때 확인해요.")
+                break
             if not c:
                 continue
             dates = [b[0] for b in s["bars"]]
@@ -735,7 +760,9 @@ def main():
                 e["dc"] = 1
 
     # 4) 뉴스: 연결한 날 이후, 최근 며칠 이벤트만
-    if NAVER_ID and NAVER_SECRET:
+    if NAVER_ID and NAVER_SECRET and time_up():
+        warn("시간이 부족해서 뉴스는 다음 실행 때 찾아요.")
+    elif NAVER_ID and NAVER_SECRET:
         log("📰 이벤트 날 뉴스 찾기")
         for s in stocks.values():
             dates = [b[0] for b in s["bars"]]
@@ -766,6 +793,8 @@ def main():
             log(f"🗂️  과거 이벤트 기사 채우기: {len(todo)}종목 남음")
             done = 0
             for s, pend in todo:
+                if time_up():
+                    break
                 try:
                     if not backfill_news(s, pend):
                         break
