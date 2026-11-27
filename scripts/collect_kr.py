@@ -500,8 +500,28 @@ def news_page(query, start, sort="date"):
     return r.json().get("items", [])
 
 
+MATCH_VER = 2   # 기사 고르는 규칙 버전. 올리면 이미 붙은 자동 기사를 새 규칙으로 다시 골라요
+UP_WORDS = ("급등", "상승", "강세", "신고가", "상한가", "폭등", "반등", "오름", "올라", "오른", "↑", "랠리",
+            "껑충", "치솟", "훨훨", "뛰", "불기둥")
+DOWN_WORDS = ("급락", "하락", "약세", "신저가", "하한가", "폭락", "내림", "내려", "내린", "↓", "추락",
+              "털썩", "뚝", "미끄러", "곤두박질", "파란불", "주저앉")
+RECAP_WORDS = ("마감", "종합", "핫스탁", "핫종목", "시황", "장마감", "폐장")
+CAUSE_WORDS = ("특징주", "공시", "실적", "계약", "수주", "인수", "합병", "유상증자", "무상증자", "자사주", "배당",
+               "상장", "승인", "허가", "임상", "규제", "관세", "소송", "제재", "목표주가", "투자의견")
+PCT_RE = re.compile(r"(\d{1,3}(?:\.\d+)?)\s*%\s*(?:대\s*)?(?:급등|급락|상승|하락|강세|약세|올|내|오른|내린|뛴|빠진|폭등|폭락)")
+MD_RE = re.compile(r"(\d{1,2})월\s*(\d{1,2})일")
+
+
+def event_move(bars, i):
+    """(등락률, 시가 갭) — 이벤트 날 주가가 어느 쪽으로 얼마나 움직였는지."""
+    prev = bars[i - 1][4] if i else bars[i][1]
+    if not prev:
+        return 0.0, 0.0
+    return bars[i][4] / prev - 1, bars[i][1] / prev - 1
+
+
 def score_item(it, name):
-    """(발행시각, 점수, 기사정보) 또는 None. 제목에 종목명이 있어야 함."""
+    """(발행시각, 기본점수, 기사정보) 또는 None. 제목에 종목명이 있어야 함."""
     try:
         t = parsedate_to_datetime(it.get("pubDate")).astimezone(KST)
     except (TypeError, ValueError):
@@ -515,14 +535,52 @@ def score_item(it, name):
     return t, score, {"t": title, "u": url, "p": press, "tm": t.strftime("%Y-%m-%d %H:%M")}
 
 
-def pick_for_event(cands, date_iso, prev_iso):
+def judge(cand, date_iso, prev_iso, move):
+    """이벤트에 맞는 기사면 점수, 아니면 None.
+    1) 방향이 반대인 기사 탈락  2) 전날 장 정리 기사 탈락  3) 당일·특징주 기사 우선
+    4) 제목의 날짜·등락률이 실제와 다르면 탈락  5) 원인을 짐작할 단서가 없으면 탈락(확신 없으면 안 붙임)"""
+    t, base, info = cand
+    title = info["t"]
     start_t = dt.datetime.fromisoformat(prev_iso + "T15:30:00+09:00")
     end_t = dt.datetime.fromisoformat(date_iso + "T23:59:59+09:00")
-    inside = [c for c in cands if start_t < c[0] <= end_t]
-    if not inside:
+    if not (start_t < t <= end_t):
         return None
-    inside.sort(key=lambda c: (-c[1], c[0]))      # 점수 높은 것, 같으면 이른 기사
-    return inside[0][2]
+    chg, gap = move
+    main = chg if abs(chg) >= abs(gap) else gap
+    up, down = any(w in title for w in UP_WORDS), any(w in title for w in DOWN_WORDS)
+    # 1) 방향 확인 (둘 다 있으면 '급등 후 급락' 같은 경우라 통과)
+    if (main > 0 and down and not up) or (main < 0 and up and not down):
+        return None
+    same_day = t.date().isoformat() == date_iso
+    # 2) 전날(이벤트 전) 나온 장 정리 기사는 전날 이야기
+    if not same_day and any(w in title for w in RECAP_WORDS):
+        return None
+    # 4) 제목 속 날짜·등락률 맞춰보기
+    m = MD_RE.search(title)
+    if m and (int(m.group(1)), int(m.group(2))) != (int(date_iso[5:7]), int(date_iso[8:10])):
+        return None
+    biggest = max(abs(chg), abs(gap), abs(chg - gap)) * 100
+    for p in PCT_RE.findall(title):
+        if float(p) > biggest + 2.5:          # 실제보다 훨씬 큰 움직임을 말하면 다른 날 기사
+            return None
+    dir_ok = (main > 0 and up) or (main < 0 and down)
+    cause = any(w in title for w in CAUSE_WORDS)
+    # 5) 방향이 맞거나 원인 단서(특징주·공시·실적 등)가 있어야 붙임
+    if not (dir_ok or cause):
+        return None
+    # 3) 점수: 방향 일치 > 당일 기사 > 특징주 > 주요 언론사
+    return base + (3 if dir_ok else 0) + (2 if same_day else 0) + (2 if "특징주" in title else 0)
+
+
+def pick_for_event(cands, date_iso, prev_iso, move):
+    best = None
+    for c in cands:
+        s = judge(c, date_iso, prev_iso, move)
+        if s is None:
+            continue
+        if best is None or s > best[0] or (s == best[0] and c[0] < best[1]):   # 같은 점수면 이른 기사
+            best = (s, c[0], c[2])
+    return best[2] if best else None
 
 
 def backfill_news(stock, pending):
@@ -541,48 +599,64 @@ def backfill_news(stock, pending):
                     cands.append(c)
             if len(items) < 100:
                 break
-    dates = [b[0] for b in stock["bars"]]
+    bars = stock["bars"]
+    dates = [b[0] for b in bars]
     for d in pending:
         i = dates.index(d)
         e = stock["events"].setdefault(d, {})
-        found = pick_for_event(cands, d, dates[i - 1] if i else d)
+        found = pick_for_event(cands, d, dates[i - 1] if i else d, event_move(bars, i))
         if found:
             e["n"] = found
-        e["nb"] = 1                                     # 과거 기사 찾기 시도 완료
+        else:
+            e.pop("n", None)                             # 예전 규칙으로 붙은 틀린 기사도 지움
+        e["nb"] = MATCH_VER                              # 과거 기사 찾기 시도 완료 (규칙 버전)
     return True
 
 
-def find_news(name, date_iso, prev_iso):
-    """이벤트 날 기사 1건: (전 거래일 15:30, 당일 23:59] 사이, 제목에 종목명, 주요 언론사 우선."""
+def drop_bad_old_articles(stock):
+    """예전 규칙으로 붙은 기사를 새 규칙으로 검사해서 틀린 건 바로 지움 (API 호출 없음). 지운 개수 반환."""
+    bars = stock["bars"]
+    dates = [b[0] for b in bars]
+    dropped = 0
+    for d, e in stock.get("events", {}).items():
+        n = e.get("n")
+        if not n or d not in dates or max(int(e.get("nb") or 0), int(e.get("nc") or 0)) >= MATCH_VER:
+            continue
+        i = dates.index(d)
+        try:
+            t = dt.datetime.fromisoformat(n["tm"] + ":00+09:00")
+        except (KeyError, ValueError):
+            continue
+        base = (2 if press_of(n.get("u", ""))[1] else 0) + (1 if any(w in n.get("t", "") for w in NEWS_WORDS) else 0)
+        if judge((t, base, n), d, dates[i - 1] if i else d, event_move(bars, i)) is None:
+            e.pop("n", None)
+            dropped += 1
+    return dropped
+
+
+def find_news(name, date_iso, prev_iso, move):
+    """최근 이벤트 기사 1건: 날짜순 검색으로 (전 거래일 15:30, 당일 23:59] 기사를 모아 judge()로 고름."""
     start_t = dt.datetime.fromisoformat(prev_iso + "T15:30:00+09:00")
-    end_t = dt.datetime.fromisoformat(date_iso + "T23:59:59+09:00")
-    best = None
+    cands = []
     for start in range(1, 1000, 100):
         items = news_page(name, start)
         if not items:
             break
         oldest = None
         for it in items:
+            c = score_item(it, name)
             try:
                 t = parsedate_to_datetime(it.get("pubDate")).astimezone(KST)
+                oldest = t if oldest is None or t < oldest else oldest
             except (TypeError, ValueError):
-                continue
-            oldest = t if oldest is None or t < oldest else oldest
-            if not (start_t < t <= end_t):
-                continue
-            title = clean(it.get("title"))
-            if name not in title:
-                continue
-            url = it.get("originallink") or it.get("link")
-            press, major = press_of(url)
-            score = (2 if major else 0) + (1 if any(w in title for w in NEWS_WORDS) else 0)
-            if best is None or score >= best[0]:   # 같은 점수면 더 이른 기사(움직임의 원인에 가까움)
-                best = (score, {"t": title, "u": url, "p": press, "tm": t.strftime("%Y-%m-%d %H:%M")})
+                pass
+            if c:
+                cands.append(c)
         if oldest is not None and oldest <= start_t:
             break
         if len(items) < 100:
             break
-    return best[1] if best else None
+    return pick_for_event(cands, date_iso, prev_iso, move)
 
 
 # ---------------------------------------------------------------- 직접 고정한 기사: 제목 채우기
@@ -760,6 +834,10 @@ def main():
                 e["dc"] = 1
 
     # 4) 뉴스: 연결한 날 이후, 최근 며칠 이벤트만
+    dropped = sum(drop_bad_old_articles(s) for s in stocks.values())
+    if dropped:
+        log(f"🧹 새 기준에 안 맞는 예전 기사 {dropped}건 지움")
+
     if NAVER_ID and NAVER_SECRET and time_up():
         warn("시간이 부족해서 뉴스는 다음 실행 때 찾아요.")
     elif NAVER_ID and NAVER_SECRET:
@@ -768,25 +846,38 @@ def main():
             dates = [b[0] for b in s["bars"]]
             for d in sorted(detect_events(s["bars"])):
                 e = s["events"].setdefault(d, {})
-                if e.get("nc") or d < meta["news_since"] or days_since(d) > NEWS_LOOKBACK_DAYS:
+                if int(e.get("nc") or 0) >= MATCH_VER or d < meta["news_since"] or days_since(d) > NEWS_LOOKBACK_DAYS:
                     continue
                 if NEWS_CALLS >= NEWS_MAX_CALLS:
                     warn("오늘 뉴스 호출 상한에 도달해서 나머지는 내일 이어서 찾아요.")
                     break
                 i = dates.index(d)
                 try:
-                    e["n"] = find_news(s["name"], d, dates[i - 1] if i else d)
-                    e["nc"] = 1
+                    found = find_news(s["name"], d, dates[i - 1] if i else d, event_move(s["bars"], i))
+                    if found:
+                        e["n"] = found
+                    else:
+                        e.pop("n", None)
+                    e["nc"] = MATCH_VER
                 except Exception as err:
                     warn(f"{s['name']} 뉴스: {err}")
         log(f"   뉴스 API 호출 {NEWS_CALLS}회")
 
         # 4-2) 과거 이벤트 기사 채우기: 하루 상한만큼씩 매일 이어서
         todo = []
+        def ver(e, k):
+            return int(e.get(k) or 0)
+
         for s in stocks.values():
-            pend = [d for d in sorted(detect_events(s["bars"]))
-                    if not s["events"].get(d, {}).get("n") and not s["events"].get(d, {}).get("nb")
-                    and (d < meta["news_since"] or s["events"].get(d, {}).get("nc") or days_since(d) > NEWS_LOOKBACK_DAYS)]
+            pend = []
+            for d in sorted(detect_events(s["bars"])):
+                e = s["events"].get(d, {})
+                if ver(e, "nb") >= MATCH_VER:                          # 새 규칙으로 이미 찾아봄
+                    continue
+                if e.get("n") and ver(e, "nc") >= MATCH_VER:           # 최근 기사 검색으로 이미 찾음
+                    continue
+                if d < meta["news_since"] or ver(e, "nc") >= MATCH_VER or days_since(d) > NEWS_LOOKBACK_DAYS:
+                    pend.append(d)
             if pend:
                 todo.append((s, pend))
         if todo:
