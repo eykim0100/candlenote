@@ -19,7 +19,7 @@ import time
 import zipfile
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 from xml.etree import ElementTree as ET
 
 import requests
@@ -42,11 +42,13 @@ BACKFILL_MAX_CALLS = 5000  # 과거 이벤트 기사 채우기용 하루 상한 
 BACKFILL_PAGES = 10        # 검색어 하나당 최대 100건 × 10쪽
 
 KEY_PRICE = os.environ.get("DATA_GO_KR_KEY", "").strip()
+if "%" in KEY_PRICE:   # Encoding 키를 넣었어도 Decoding 키로 바꿔서 사용 (Decoding 키에는 %가 없음)
+    KEY_PRICE = unquote(KEY_PRICE)
 KEY_DART = os.environ.get("DART_API_KEY", "").strip()
 NAVER_ID = os.environ.get("NAVER_CLIENT_ID", "").strip()
 NAVER_SECRET = os.environ.get("NAVER_CLIENT_SECRET", "").strip()
 
-PRICE_URL = "https://apis.data.go.kr/1160100/service/GetStockSecuritiesInfoService/getStockPriceInfo"
+PRICE_URL = "https://apis.data.go.kr/1160100/GetStockSecuritiesInfoService_V2/getStockPriceInfo_V2"  # 금융위원회_주식시세정보 (V2)
 DART = "https://opendart.fss.or.kr/api"
 NEWS_URL = "https://naverapihub.apigw.ntruss.com/search/v1/news"
 
@@ -148,6 +150,10 @@ def price_call(**params):
         raise RuntimeError(f"공공데이터포털 응답 오류: {reason} "
                            "(인증키가 아직 활성화 전이거나 DATA_GO_KR_KEY에 Decoding 키가 아닌 값이 들어갔을 수 있어요)")
     j = r.json()
+    auth = (j.get("OpenAPI_ServiceResponse") or {}).get("cmmMsgHeader") if isinstance(j, dict) else None
+    if auth:   # 키 오류가 JSON으로 오는 경우
+        raise RuntimeError(f"공공데이터포털 인증 오류: {auth.get('returnAuthMsg') or auth.get('errMsg')} "
+                           f"(코드 {auth.get('returnReasonCode')}). DATA_GO_KR_KEY 값과 '금융위원회_주식시세정보' 활용신청 상태를 확인해 주세요")
     resp = j.get("response", j)          # 보통은 {"response": {...}}, 형식이 다르면 그대로
     header = resp.get("header", {}) if isinstance(resp, dict) else {}
     code = header.get("resultCode") or j.get("resultCode")
